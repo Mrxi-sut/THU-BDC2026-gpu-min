@@ -14,6 +14,11 @@ config = {
     'dropout': 0.1,
     'feature_num': feature_num,
     'max_grad_norm': 5.0,
+    # Transformer输入侧的金融语义分组门控。训练/推理时会把实际
+    # feature_columns 写入 config，模型据此按价格、动量、波动率、
+    # 成交量、K线、突破等组动态分配权重。
+    'semantic_feature_gate_enabled': True,
+    'semantic_gate_regime_dim': 16,
 
     'pairwise_weight': 1, # 配对损失权重
     'base_weight': 1.0, # 非top-k样本权重

@@ -129,6 +129,7 @@ def main():
 	stockid2idx = {sid: idx for idx, sid in enumerate(stock_ids)}
 
 	processed, features = preprocess_predict_data(raw_df, stockid2idx)
+	config['feature_columns'] = list(features)
 	processed[features] = processed[features].replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
 	scaler = joblib.load(scaler_path)
