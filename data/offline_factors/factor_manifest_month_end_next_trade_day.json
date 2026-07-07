@@ -1,0 +1,15 @@
+[
+  {
+    "file": "D:\\Bigdata\\THU-BDC2026-gpu-min\\data\\offline_factors\\index_weight_factors.csv",
+    "status": "ok",
+    "rows": 3934,
+    "stocks": 281,
+    "min_date": "2026-06-02",
+    "max_date": "2026-06-22",
+    "asof_policy": "month_end_next_trade_day",
+    "invalid_visible_rows_dropped": 61107,
+    "max_visible_lag_days": 1,
+    "max_weight_age_days": 21,
+    "family": "index_weight"
+  }
+]

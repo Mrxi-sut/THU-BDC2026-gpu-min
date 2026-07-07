@@ -1,0 +1,28 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+
+
+.DS_Store
+
+.vscode
+
+*.zip
+
+*.tar
+
+# Generated training artifacts
+model/
+output/
+
+# Local datasets and generated offline factors
+data/*.csv
+data/offline_factors/*.csv

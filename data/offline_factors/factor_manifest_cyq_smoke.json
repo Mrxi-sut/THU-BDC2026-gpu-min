@@ -1,0 +1,11 @@
+[
+  {
+    "file": "D:\\Bigdata\\THU-BDC2026-gpu-min\\data\\offline_factors\\cyq_perf_factors.csv",
+    "status": "ok",
+    "rows": 100,
+    "stocks": 5,
+    "min_date": "2026-05-25",
+    "max_date": "2026-06-22",
+    "family": "cyq_perf"
+  }
+]

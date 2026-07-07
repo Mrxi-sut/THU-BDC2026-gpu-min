@@ -1,0 +1,11 @@
+[
+  {
+    "file": "D:\\Bigdata\\THU-BDC2026-gpu-min\\data\\offline_factors\\industry_factors.csv",
+    "status": "ok",
+    "rows": 2665,
+    "stocks": 5,
+    "min_date": "2024-04-09",
+    "max_date": "2026-06-22",
+    "family": "industry"
+  }
+]
