@@ -637,6 +637,9 @@ def main():
     # 2. 特征工程与预处理
     train_data, features = preprocess_data(train_df, is_train=True, stockid2idx=stockid2idx)
     val_data, _ = preprocess_val_data(val_df, stockid2idx=stockid2idx)
+    config['feature_columns'] = list(features)
+    with open(os.path.join(output_dir, 'config.json'), 'w') as f:
+        json.dump(config, f, indent=4, ensure_ascii=False)
     
     # 3. 标准化
     scaler = StandardScaler()

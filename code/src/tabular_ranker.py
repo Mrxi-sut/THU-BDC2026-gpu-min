@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 from pandas.errors import PerformanceWarning
 from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor
+from sklearn.linear_model import LogisticRegression
 
 warnings.simplefilter("ignore", PerformanceWarning)
 
@@ -114,6 +115,25 @@ SELECTOR_DEBUG_COLUMNS = [
     "selector_defensive",
     "selector_regime",
 ]
+
+SELECTOR_GATE_BRANCHES = (
+    "selector_consensus",
+    "selector_hot_rotation",
+    "selector_defensive",
+)
+
+SELECTOR_GATE_FEATURE_COLUMNS = (
+    "market_ret_5",
+    "market_ret_20",
+    "up_ratio_5",
+    "up_ratio_20",
+    "market_drawdown_20",
+    "ret5_p95_minus_median",
+    "ret20_p95_minus_median",
+    "amount_ratio20_p90_p50",
+    "top2_vs_top10_gap",
+    "selector_hgb_overlap",
+)
 
 SELECTOR_AUXILIARY_PREFIXES = (
     "ts_ind_",
@@ -779,9 +799,155 @@ def _add_blended_score(df: pd.DataFrame, component_weights: Dict[str, float], he
     return scored
 
 
+def _selector_gate_feature_row(
+    snapshot: Dict[str, float] | None,
+    score_profile: Dict[str, float] | None,
+    hgb_overlap: float,
+) -> Dict[str, float]:
+    snapshot = snapshot or {}
+    score_profile = score_profile or {}
+    row = {
+        "market_ret_5": float(snapshot.get("market_ret_5", 0.0) or 0.0),
+        "market_ret_20": float(snapshot.get("market_ret_20", 0.0) or 0.0),
+        "up_ratio_5": float(snapshot.get("up_ratio_5", 0.5) or 0.5),
+        "up_ratio_20": float(snapshot.get("up_ratio_20", 0.5) or 0.5),
+        "market_drawdown_20": float(snapshot.get("market_drawdown_20", 0.0) or 0.0),
+        "ret5_p95_minus_median": float(snapshot.get("ret5_p95_minus_median", 0.0) or 0.0),
+        "ret20_p95_minus_median": float(snapshot.get("ret20_p95_minus_median", 0.0) or 0.0),
+        "amount_ratio20_p90_p50": float(snapshot.get("amount_ratio20_p90_p50", 1.0) or 1.0),
+        "top2_vs_top10_gap": float(score_profile.get("top2_vs_top10_gap", 0.0) or 0.0),
+        "selector_hgb_overlap": float(hgb_overlap or 0.0),
+    }
+    for key, value in row.items():
+        if not np.isfinite(value):
+            row[key] = 0.0
+    return row
+
+
+def _neutral_selector_gate_weights() -> Dict[str, float]:
+    return {
+        "selector_consensus": 0.50,
+        "selector_hot_rotation": 0.25,
+        "selector_defensive": 0.25,
+    }
+
+
+def _predict_selector_gate_weights(
+    selector_gate: Dict[str, object] | None,
+    snapshot: Dict[str, float] | None,
+    score_profile: Dict[str, float] | None,
+    hgb_overlap: float,
+) -> Dict[str, float] | None:
+    if not selector_gate or selector_gate.get("model") is None:
+        return None
+
+    feature_columns = selector_gate.get("feature_columns", SELECTOR_GATE_FEATURE_COLUMNS)
+    medians = selector_gate.get("feature_medians", {})
+    feature_row = _selector_gate_feature_row(snapshot, score_profile, hgb_overlap)
+    x = pd.DataFrame([{col: feature_row.get(col, medians.get(col, 0.0)) for col in feature_columns}])
+    x = x.replace([np.inf, -np.inf], np.nan).fillna(pd.Series(medians)).fillna(0.0)
+
+    model = selector_gate["model"]
+    if not hasattr(model, "predict_proba"):
+        return None
+
+    probs = model.predict_proba(x)[0]
+    weights = {branch: 0.0 for branch in SELECTOR_GATE_BRANCHES}
+    for cls, prob in zip(model.classes_, probs):
+        branch = str(cls)
+        if branch in weights:
+            weights[branch] = float(prob)
+
+    total = sum(weights.values())
+    if total <= 1e-12:
+        return _neutral_selector_gate_weights()
+    return {branch: weight / total for branch, weight in weights.items()}
+
+
+def _fit_selector_gate_model(
+    val_pred: pd.DataFrame,
+    val_table: pd.DataFrame,
+    raw_df: pd.DataFrame,
+    seed: int,
+) -> Dict[str, object] | None:
+    """
+    Learn which selector branch works best under each validation-day regime.
+
+    The target is the branch with the highest daily Top3 future return. Features
+    only use information visible at the prediction date plus current score shape.
+    """
+    try:
+        from positioning import compute_market_snapshot, compute_score_profile
+    except Exception as exc:
+        print(f"学习型 selector gate 跳过：无法加载市场状态工具: {exc}")
+        return None
+
+    rows = []
+    targets = []
+    val_future = val_table[["股票代码", "日期", "future_return"]].copy()
+    val_future["股票代码"] = val_future["股票代码"].astype(str).str.zfill(6)
+
+    for date, day_pred in val_pred.groupby("日期", sort=True):
+        day = day_pred.merge(val_future, on=["股票代码", "日期"], how="left")
+        day = day.dropna(subset=["future_return"]).copy()
+        if len(day) < 10:
+            continue
+
+        snapshot_seed_col = "controlled_hotspot" if "controlled_hotspot" in day.columns else "tabular_score"
+        snapshot_seed = day.sort_values(snapshot_seed_col, ascending=False)["股票代码"].head(5).tolist()
+        snapshot = compute_market_snapshot(raw_df, date, snapshot_seed)
+        branch_scored = add_strategy_selector_score(day, snapshot)
+        profile_df = branch_scored.sort_values("selector_consensus", ascending=False).rename(
+            columns={"selector_consensus": "final_score"}
+        )
+        score_profile = compute_score_profile(profile_df, "final_score")
+        hgb_overlap = float(branch_scored["selector_hgb_overlap"].iloc[0]) if "selector_hgb_overlap" in branch_scored else 0.0
+
+        branch_returns = {}
+        for branch in SELECTOR_GATE_BRANCHES:
+            if branch not in branch_scored.columns:
+                continue
+            selected = branch_scored.nlargest(3, branch)
+            branch_returns[branch] = float(selected["future_return"].mean())
+        if len(branch_returns) < 2:
+            continue
+
+        rows.append(_selector_gate_feature_row(snapshot, score_profile, hgb_overlap))
+        targets.append(max(branch_returns, key=branch_returns.get))
+
+    if len(rows) < 12 or len(set(targets)) < 2:
+        print(
+            "学习型 selector gate 样本不足，保留规则回退: "
+            f"samples={len(rows)}, classes={sorted(set(targets))}"
+        )
+        return None
+
+    train_x = pd.DataFrame(rows, columns=SELECTOR_GATE_FEATURE_COLUMNS)
+    medians = train_x.median(numeric_only=True).to_dict()
+    train_x = train_x.replace([np.inf, -np.inf], np.nan).fillna(pd.Series(medians)).fillna(0.0)
+    model = LogisticRegression(
+        max_iter=500,
+        class_weight="balanced",
+        random_state=seed,
+    )
+    model.fit(train_x, targets)
+    print(
+        "学习型 selector gate 已训练: "
+        f"samples={len(train_x)}, classes={dict(pd.Series(targets).value_counts())}"
+    )
+    return {
+        "model": model,
+        "feature_columns": list(SELECTOR_GATE_FEATURE_COLUMNS),
+        "feature_medians": medians,
+        "training_samples": len(train_x),
+        "target_counts": dict(pd.Series(targets).value_counts()),
+    }
+
+
 def add_strategy_selector_score(
     df: pd.DataFrame,
     snapshot: Dict[str, float] | None = None,
+    selector_gate: Dict[str, object] | None = None,
 ) -> pd.DataFrame:
     """
     第二层离线日线 selector。
@@ -872,7 +1038,34 @@ def add_strategy_selector_score(
     )
     defensive_regime = market_under_pressure and weak_breadth and not hot_candidates
 
-    if controlled_theme_squeeze:
+    profile_df = scored.sort_values("selector_consensus", ascending=False).rename(
+        columns={"selector_consensus": "final_score"}
+    )
+    try:
+        from positioning import compute_score_profile
+
+        score_profile = compute_score_profile(profile_df, "final_score")
+    except Exception:
+        score_profile = {}
+
+    learned_weights = _predict_selector_gate_weights(
+        selector_gate,
+        snapshot,
+        score_profile,
+        hgb_overlap,
+    )
+
+    if learned_weights is not None:
+        scored["selector_score"] = (
+            learned_weights["selector_consensus"] * scored["selector_consensus"]
+            + learned_weights["selector_hot_rotation"] * scored["selector_hot_rotation"]
+            + learned_weights["selector_defensive"] * scored["selector_defensive"]
+        )
+        regime = "learned_regime_gate"
+        scored["selector_gate_consensus_weight"] = learned_weights["selector_consensus"]
+        scored["selector_gate_hot_rotation_weight"] = learned_weights["selector_hot_rotation"]
+        scored["selector_gate_defensive_weight"] = learned_weights["selector_defensive"]
+    elif controlled_theme_squeeze:
         scored["selector_score"] = controlled_hotspot
         regime = "controlled_theme_squeeze"
     elif rotation_regime:
@@ -895,6 +1088,10 @@ def add_strategy_selector_score(
 
     scored["selector_regime"] = regime
     scored["selector_hgb_overlap"] = hgb_overlap
+    if "selector_gate_consensus_weight" not in scored.columns:
+        scored["selector_gate_consensus_weight"] = np.nan
+        scored["selector_gate_hot_rotation_weight"] = np.nan
+        scored["selector_gate_defensive_weight"] = np.nan
     return scored
 
 
@@ -965,6 +1162,10 @@ def train_tabular_ranker(
             val_pred[col] = val_table[col].values
 
     val_pred = _add_blended_score(val_pred, component_weights, heuristic_weights)
+    selector_gate = None
+    if config.get("selector_gate_enabled", True):
+        selector_gate = _fit_selector_gate_model(val_pred, val_table, raw_df, seed)
+
     val_metrics = _daily_topk_score(val_pred, "tabular_score", k=5)
     print(
         "表格模型验证: "
@@ -984,6 +1185,7 @@ def train_tabular_ranker(
         "heuristic_weights": heuristic_weights,
         "min_history_days": min_history_days,
         "validation_metrics": val_metrics,
+        "selector_gate": selector_gate,
     }
     os.makedirs(output_dir, exist_ok=True)
     model_path = os.path.join(output_dir, model_file_name)
@@ -1027,5 +1229,6 @@ def predict_tabular_ranker(
     pred = copy_selector_auxiliary_columns(pred, latest)
 
     pred = _add_blended_score(pred, bundle["component_weights"], bundle["heuristic_weights"])
-    pred = add_strategy_selector_score(pred)
+    pred = add_strategy_selector_score(pred, selector_gate=bundle.get("selector_gate"))
+    pred.attrs["selector_gate"] = bundle.get("selector_gate")
     return pred.sort_values("tabular_score", ascending=False).reset_index(drop=True)

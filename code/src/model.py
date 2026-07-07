@@ -4,6 +4,120 @@ import torch.nn.functional as F
 import numpy as np
 import math
 
+
+def _feature_group_name(feature_name):
+    """Map engineered features to finance-semantic groups used by the gate."""
+    name = str(feature_name)
+    upper = name.upper()
+    lower = name.lower()
+
+    if name == 'instrument':
+        return 'identity'
+    if name in {'开盘', '收盘', '最高', '最低'} or upper in {'OPEN0', 'HIGH0', 'LOW0', 'VWAP0'}:
+        return 'price'
+    if name in {'成交量', '成交额', '换手率'}:
+        return 'volume_liquidity'
+    if name in {'振幅', '涨跌额', '涨跌幅'}:
+        return 'return_momentum'
+    if upper.startswith(('ROC', 'RANK', 'RSV')) or lower.startswith('return_') or lower in {'rsi', 'macd', 'macd_signal', 'kdj_k', 'kdj_d', 'kdj_j'}:
+        return 'return_momentum'
+    if upper.startswith(('MA', 'EMA', 'SMA', 'BETA', 'RSQR', 'RESI')) or lower.startswith(('sma_', 'ema_')):
+        return 'trend'
+    if upper.startswith('STD') or lower.startswith(('volatility_', 'atr_', 'boll_')):
+        return 'volatility'
+    if upper.startswith(('VMA', 'VSTD', 'WVMA', 'VSUMP', 'VSUMN', 'VSUMD')) or lower.startswith(('volume_', 'obv')):
+        return 'volume_liquidity'
+    if upper.startswith(('MAX', 'MIN', 'QTLU', 'QTLD', 'IMAX', 'IMIN', 'IMXD')):
+        return 'breakout_position'
+    if upper.startswith(('KMID', 'KLEN', 'KUP', 'KLOW', 'KSFT')) or lower.endswith('_spread'):
+        return 'candlestick'
+    if upper.startswith(('CORR', 'CORD')):
+        return 'volume_price_relation'
+    if upper.startswith(('CNTP', 'CNTN', 'CNTD', 'SUMP', 'SUMN', 'SUMD')):
+        return 'path_statistics'
+    return 'other'
+
+
+def build_semantic_feature_groups(feature_names, input_dim):
+    if not feature_names or len(feature_names) != input_dim:
+        return [('all_features', list(range(input_dim)))]
+
+    group_order = [
+        'identity',
+        'price',
+        'candlestick',
+        'return_momentum',
+        'trend',
+        'volatility',
+        'volume_liquidity',
+        'volume_price_relation',
+        'breakout_position',
+        'path_statistics',
+        'other',
+    ]
+    grouped = {name: [] for name in group_order}
+    for idx, feature_name in enumerate(feature_names):
+        grouped.setdefault(_feature_group_name(feature_name), []).append(idx)
+    return [(name, grouped[name]) for name in group_order if grouped.get(name)]
+
+
+class SemanticRegimeGatedProjection(nn.Module):
+    """
+    Finance-semantic feature projection.
+
+    Each feature group receives its own projection. A light market-regime encoder
+    reads group-level sequence statistics and emits a softmax gate over groups.
+    """
+    def __init__(self, input_dim, d_model, feature_names, dropout=0.1, regime_dim=16):
+        super(SemanticRegimeGatedProjection, self).__init__()
+        groups = build_semantic_feature_groups(feature_names, input_dim)
+        self.group_names = [name for name, _ in groups]
+        self.group_count = len(groups)
+        self.group_projections = nn.ModuleList()
+        self.regime_projections = nn.ModuleList()
+        self.dropout = nn.Dropout(dropout)
+
+        for group_idx, (_, indices) in enumerate(groups):
+            index_tensor = torch.tensor(indices, dtype=torch.long)
+            self.register_buffer(f'group_indices_{group_idx}', index_tensor)
+            group_dim = len(indices)
+            self.group_projections.append(nn.Linear(group_dim, d_model))
+            self.regime_projections.append(
+                nn.Sequential(
+                    nn.Linear(group_dim * 3, regime_dim),
+                    nn.GELU(),
+                )
+            )
+
+        self.gate = nn.Sequential(
+            nn.Linear(regime_dim * self.group_count, max(regime_dim, self.group_count * 2)),
+            nn.GELU(),
+            nn.Linear(max(regime_dim, self.group_count * 2), self.group_count),
+            nn.Softmax(dim=-1),
+        )
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        # x: [batch*num_stocks, seq_len, feature_dim]
+        projected_groups = []
+        regime_states = []
+        for group_idx in range(self.group_count):
+            indices = getattr(self, f'group_indices_{group_idx}')
+            group_x = x.index_select(dim=-1, index=indices)
+            projected_groups.append(self.group_projections[group_idx](group_x))
+
+            group_mean = group_x.mean(dim=1)
+            group_std = group_x.std(dim=1, unbiased=False)
+            group_last = group_x[:, -1, :]
+            regime_input = torch.cat([group_mean, group_std, group_last], dim=-1)
+            regime_states.append(self.regime_projections[group_idx](regime_input))
+
+        regime_state = torch.cat(regime_states, dim=-1)
+        gates = self.gate(regime_state)
+        stacked = torch.stack(projected_groups, dim=1)
+        gated = (stacked * gates[:, :, None, None]).sum(dim=1)
+        return self.norm(self.dropout(gated))
+
 # 位置编码模块
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, dropout=0.1, max_len=5000):
@@ -60,9 +174,19 @@ class StockTransformer(nn.Module):
         self.model_type = 'RankingTransformer'
         self.config = config
         self.num_stocks = num_stocks
+        self.use_semantic_gate = bool(config.get('semantic_feature_gate_enabled', True))
         
         # 输入投影层
-        self.input_proj = nn.Linear(input_dim, config['d_model'])
+        if self.use_semantic_gate:
+            self.input_proj = SemanticRegimeGatedProjection(
+                input_dim=input_dim,
+                d_model=config['d_model'],
+                feature_names=config.get('feature_columns'),
+                dropout=config['dropout'],
+                regime_dim=int(config.get('semantic_gate_regime_dim', 16)),
+            )
+        else:
+            self.input_proj = nn.Linear(input_dim, config['d_model'])
         self.pos_encoder = PositionalEncoding(config['d_model'], config['dropout'], config['sequence_length'])
         
         # 时序特征提取
@@ -148,4 +272,3 @@ class StockTransformer(nn.Module):
         output = scores.view(batch_size, num_stocks)  # [batch, num_stocks]
         
         return output
-

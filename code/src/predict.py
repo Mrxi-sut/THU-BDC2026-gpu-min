@@ -129,6 +129,7 @@ def main():
 	stockid2idx = {sid: idx for idx, sid in enumerate(stock_ids)}
 
 	processed, features = preprocess_predict_data(raw_df, stockid2idx)
+	config['feature_columns'] = list(features)
 	processed[features] = processed[features].replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
 	scaler = joblib.load(scaler_path)
@@ -182,7 +183,11 @@ def main():
 		else:
 			snapshot_seed = lane_pred['股票代码'].head(5).tolist()
 		lane_snapshot = compute_market_snapshot(raw_df, latest_date, snapshot_seed)
-		lane_pred = add_strategy_selector_score(lane_pred, lane_snapshot)
+		lane_pred = add_strategy_selector_score(
+			lane_pred,
+			lane_snapshot,
+			selector_gate=lane_pred.attrs.get('selector_gate'),
+		)
 		if 'selector_score' in lane_pred.columns:
 			profile_df = lane_pred.sort_values('selector_score', ascending=False).rename(columns={'selector_score': 'final_score'})
 			profile = compute_score_profile(profile_df, 'final_score')
@@ -306,7 +311,11 @@ def main():
 			snapshot_seed = tabular_pred.sort_values(snapshot_seed_col, ascending=False)['股票代码'].head(5).tolist() if snapshot_seed_col in tabular_pred.columns else tabular_pred['股票代码'].head(5).tolist()
 			selector_snapshot = compute_market_snapshot(raw_df, latest_date, snapshot_seed)
 			positioning_snapshot = dict(selector_snapshot)
-			tabular_pred = add_strategy_selector_score(tabular_pred, selector_snapshot)
+			tabular_pred = add_strategy_selector_score(
+				tabular_pred,
+				selector_snapshot,
+				selector_gate=tabular_pred.attrs.get('selector_gate'),
+			)
 		tabular_pred = tabular_pred.rename(columns={'股票代码': 'stock_id'})
 		tabular_cols = [
 			col for col in [
@@ -317,7 +326,8 @@ def main():
 				'amount_moderate_20_rank', 'no_overheat_20_rank',
 				'selector_score', 'selector_consensus',
 				'selector_hot_rotation', 'selector_defensive', 'selector_regime',
-				'selector_hgb_overlap',
+				'selector_hgb_overlap', 'selector_gate_consensus_weight',
+				'selector_gate_hot_rotation_weight', 'selector_gate_defensive_weight',
 			]
 			if col in tabular_pred.columns
 		]
@@ -358,6 +368,13 @@ def main():
 			snapshot = compute_market_snapshot(raw_df, latest_date, ranked_stock_ids[:5])
 		if 'selector_regime' in score_df.columns and len(score_df) > 0:
 			snapshot['selector_regime'] = str(score_df.iloc[0]['selector_regime'])
+		for gate_col in [
+			'selector_gate_consensus_weight',
+			'selector_gate_hot_rotation_weight',
+			'selector_gate_defensive_weight',
+		]:
+			if gate_col in score_df.columns and len(score_df) > 0:
+				snapshot[gate_col] = score_df.iloc[0][gate_col]
 		profile_col = submission_score_col if submission_score_col and submission_score_col in score_df.columns else 'final_score'
 		score_profile = compute_score_profile(score_df, profile_col)
 		position_name, prediction_weights, snapshot = choose_positioning(snapshot, len(ranked_stock_ids), score_profile)
@@ -419,6 +436,8 @@ def main():
 		'second_industry_confirmation', 'third_industry_confirmation',
 		'second_overheat_risk', 'third_overheat_risk',
 		'signal_weak_flag', 'candidate_hot_flag', 'high_dispersion_flag',
+		'selector_gate_consensus_weight', 'selector_gate_hot_rotation_weight',
+		'selector_gate_defensive_weight',
 		'market_ret_5', 'market_ret_20', 'up_ratio_5', 'up_ratio_20',
 		'market_drawdown_20', 'selected_ret_5_mean', 'selected_ret_20_mean',
 		'score_top2_top3_gap', 'score_top2_vs_top10_gap',
